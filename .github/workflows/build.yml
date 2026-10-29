@@ -1,0 +1,406 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Create project and write app files
+        run: |
+          flutter create . --platforms=android --project-name mcq_maker --org com.mcq
+          rm -rf test
+          cat > pubspec.yaml <<'EOF'
+          name: mcq_maker
+          description: PG MCQ Maker
+          publish_to: 'none'
+          version: 1.0.0+1
+          environment:
+            sdk: '>=3.0.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+            http: ^1.2.0
+            file_picker: ^8.0.0
+            syncfusion_flutter_pdf: ^27.1.48
+            syncfusion_flutter_pdfviewer: ^27.1.48
+            shared_preferences: ^2.2.0
+          flutter:
+            uses-material-design: true
+          EOF
+          cat > lib/main.dart <<'EOF'
+          import 'dart:convert';
+          import 'dart:math';
+          import 'dart:typed_data';
+          import 'package:flutter/material.dart';
+          import 'package:http/http.dart' as http;
+          import 'package:file_picker/file_picker.dart';
+          import 'package:syncfusion_flutter_pdf/pdf.dart';
+          import 'package:syncfusion_flutter_pdfviewer/pdfviewer.dart' as viewer;
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          void main() => runApp(MaterialApp(
+              theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
+              home: const Home()));
+
+          class Home extends StatefulWidget {
+            const Home({super.key});
+            @override
+            State<Home> createState() => _HomeState();
+          }
+
+          class _HomeState extends State<Home> {
+            final key = TextEditingController();
+            final topic = TextEditingController();
+            final pasted = TextEditingController();
+            String fileText = '';
+            String fileName = '';
+            String status = '';
+            Uint8List? pdfBytes;
+            List<Uint8List> photos = [];
+            int count = 10;
+            bool busy = false;
+            bool stop = false;
+            String? err;
+            List qs = [];
+            Map<int, int> picked = {};
+
+            @override
+            void initState() {
+              super.initState();
+              SharedPreferences.getInstance()
+                  .then((p) => setState(() => key.text = p.getString('k') ?? ''));
+            }
+
+            Future<void> pickFile() async {
+              try {
+                final r = await FilePicker.platform.pickFiles(
+                    type: FileType.custom,
+                    allowedExtensions: ['pdf', 'txt'],
+                    withData: true);
+                if (r == null) return;
+                final f = r.files.single;
+                final b = f.bytes!;
+                String t;
+                if ((f.extension ?? '').toLowerCase() == 'txt') {
+                  pdfBytes = null;
+                  t = utf8.decode(b, allowMalformed: true);
+                } else {
+                  pdfBytes = b;
+                  final doc = PdfDocument(inputBytes: b);
+                  final ex = PdfTextExtractor(doc);
+                  final sb = StringBuffer();
+                  for (var i = 0; i < doc.pages.count; i++) {
+                    sb.writeln('[PAGE ${i + 1}]');
+                    sb.writeln(ex.extractText(startPageIndex: i, endPageIndex: i));
+                    sb.write('\f');
+                  }
+                  doc.dispose();
+                  t = sb.toString();
+                }
+                setState(() {
+                  fileText = t;
+                  fileName = '${f.name} (${t.length} chars)';
+                });
+              } catch (e) {
+                setState(() => err = 'File error: $e');
+              }
+            }
+
+            Future<void> pickPhotos() async {
+              final r = await FilePicker.platform
+                  .pickFiles(type: FileType.image, allowMultiple: true, withData: true);
+              if (r == null) return;
+              setState(() => photos = r.files.map((f) => f.bytes!).toList());
+            }
+
+            String context_() {
+              final all = '$fileText\f${pasted.text}';
+              if (topic.text.trim().isEmpty) return all;
+              final words = topic.text
+                  .toLowerCase()
+                  .split(RegExp(r'\s+'))
+                  .where((w) => w.length > 2)
+                  .toList();
+              final hit = all.split('\f').where((p) {
+                final l = p.toLowerCase();
+                return words.any(l.contains);
+              }).join('\f');
+              return hit.trim().isEmpty ? all : hit;
+            }
+
+            List<String> chunks(String t) {
+              final out = <String>[];
+              var cur = StringBuffer();
+              for (final p in t.split('\f')) {
+                if (p.trim().isEmpty) continue;
+                if (cur.length + p.length > 30000 && cur.isNotEmpty) {
+                  out.add(cur.toString());
+                  cur = StringBuffer();
+                }
+                cur.writeln(p);
+              }
+              if (cur.isNotEmpty) out.add(cur.toString());
+              return out;
+            }
+
+            Future<List> ask(List parts) async {
+              for (var t = 0; t < 4; t++) {
+                final res = await http.post(
+                    Uri.parse(
+                        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.text.trim()}'),
+                    headers: {'Content-Type': 'application/json'},
+                    body: jsonEncode({
+                      'contents': [
+                        {'parts': parts}
+                      ],
+                      'generationConfig': {
+                        'responseMimeType': 'application/json',
+                        'maxOutputTokens': 65000
+                      }
+                    }));
+                if (res.statusCode == 429 || res.statusCode == 503) {
+                  await Future.delayed(const Duration(seconds: 20));
+                  continue;
+                }
+                final j = jsonDecode(res.body);
+                if (j['candidates'] == null) throw j['error']?['message'] ?? res.body;
+                final out = jsonDecode(j['candidates'][0]['content']['parts'][0]['text']);
+                return out is List ? out : [out];
+              }
+              throw 'Rate limit hit. Try again later.';
+            }
+
+            Future<void> generate() async {
+              if (key.text.trim().isEmpty) {
+                setState(() => err = 'Enter Gemini API key');
+                return;
+              }
+              setState(() {
+                busy = true;
+                stop = false;
+                err = null;
+                qs = [];
+                picked = {};
+              });
+              try {
+                (await SharedPreferences.getInstance()).setString('k', key.text.trim());
+                final head =
+                    'You are a PG medical entrance (NEET-PG/INI-CET) question setter. '
+                    'Write as many high-yield, clinical/application-style, non-repeating MCQs as the material supports (at least $count, up to 40). ';
+                const fmt =
+                    'Return a JSON array; each item: {"q":string,"options":[4 strings],"answer":index 0-3,"explanation":short string,'
+                    '"page":integer from the [PAGE n] marker (null if none),"source":exact line of max 20 words from the material proving the answer}.';
+                final jobs = <List>[];
+                final ctx = context_().trim();
+                if (ctx.isEmpty && photos.isEmpty) {
+                  jobs.add([
+                    {
+                      'text':
+                          '$head Use standard PG textbook knowledge on: "${topic.text}". $fmt'
+                    }
+                  ]);
+                }
+                for (final c in chunks(ctx)) {
+                  jobs.add([
+                    {
+                      'text':
+                          '$head Using ONLY the text below. Topic: "${topic.text}". Each page starts with [PAGE n]. $fmt\n\nTEXT:\n$c'
+                    }
+                  ]);
+                }
+                for (var i = 0; i < photos.length; i += 4) {
+                  final part = <Map>[
+                    {
+                      'text':
+                          '$head Using ONLY these book page photos. Topic: "${topic.text}". $fmt'
+                    }
+                  ];
+                  for (final b in photos.sublist(i, min(i + 4, photos.length))) {
+                    part.add({
+                      'inline_data': {
+                        'mime_type': b[0] == 0x89 ? 'image/png' : 'image/jpeg',
+                        'data': base64Encode(b)
+                      }
+                    });
+                  }
+                  jobs.add(part);
+                }
+                for (var i = 0; i < jobs.length; i++) {
+                  if (stop) break;
+                  setState(() => status = 'Part ${i + 1}/${jobs.length} • ${qs.length} MCQs');
+                  try {
+                    final r = await ask(jobs[i]);
+                    setState(() => qs.addAll(r));
+                  } catch (e) {
+                    err = '$e';
+                  }
+                  await Future.delayed(const Duration(seconds: 7));
+                }
+              } catch (e) {
+                err = '$e';
+              }
+              setState(() {
+                busy = false;
+                status = 'Done • ${qs.length} MCQs';
+              });
+            }
+
+            @override
+            Widget build(BuildContext c) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('PG MCQ Maker')),
+                body: ListView(padding: const EdgeInsets.all(12), children: [
+                  TextField(
+                      controller: key,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                          labelText: 'Gemini API key (free)',
+                          border: OutlineInputBorder())),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                      onPressed: pickFile,
+                      icon: const Icon(Icons.upload_file),
+                      label: Text(fileName.isEmpty ? 'Pick PDF / TXT' : fileName)),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                      onPressed: pickPhotos,
+                      icon: const Icon(Icons.photo_library),
+                      label: Text(photos.isEmpty
+                          ? 'Add book page photos'
+                          : '${photos.length} photos selected')),
+                  const SizedBox(height: 8),
+                  TextField(
+                      controller: pasted,
+                      maxLines: 3,
+                      decoration: const InputDecoration(
+                          labelText: 'Or paste OCR text',
+                          border: OutlineInputBorder())),
+                  const SizedBox(height: 8),
+                  TextField(
+                      controller: topic,
+                      decoration: const InputDecoration(
+                          labelText: 'Chapter / topic (empty = everything)',
+                          border: OutlineInputBorder())),
+                  Row(children: [
+                    const Text('Min MCQs/part: '),
+                    Expanded(
+                        child: Slider(
+                            value: count.toDouble(),
+                            min: 5,
+                            max: 30,
+                            divisions: 5,
+                            label: '$count',
+                            onChanged: (v) => setState(() => count = v.round()))),
+                    Text('$count')
+                  ]),
+                  Row(children: [
+                    Expanded(
+                        child: FilledButton(
+                            onPressed: busy ? null : generate,
+                            child: Text(busy ? 'Generating...' : 'Generate MCQs'))),
+                    if (busy)
+                      TextButton(
+                          onPressed: () => setState(() => stop = true),
+                          child: const Text('Stop')),
+                  ]),
+                  if (status.isNotEmpty)
+                    Padding(padding: const EdgeInsets.all(6), child: Text(status)),
+                  if (err != null)
+                    Padding(
+                        padding: const EdgeInsets.all(8),
+                        child: Text(err!, style: const TextStyle(color: Colors.red))),
+                  for (var i = 0; i < qs.length; i++) card(i),
+                ]),
+              );
+            }
+
+            Widget card(int i) {
+              final q = qs[i];
+              final sel = picked[i];
+              final opts = (q['options'] as List?) ?? [];
+              final ans = (q['answer'] as num?)?.toInt() ?? 0;
+              final page = int.tryParse('${q['page']}');
+              return Card(
+                  margin: const EdgeInsets.only(top: 12),
+                  child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('${i + 1}. ${q['q']}',
+                                style: const TextStyle(fontWeight: FontWeight.bold)),
+                            for (var o = 0; o < opts.length; o++)
+                              ListTile(
+                                  dense: true,
+                                  title: Text('${String.fromCharCode(65 + o)}. ${opts[o]}'),
+                                  tileColor: sel == null
+                                      ? null
+                                      : o == ans
+                                          ? Colors.green.shade100
+                                          : o == sel
+                                              ? Colors.red.shade100
+                                              : null,
+                                  onTap: sel == null
+                                      ? () => setState(() => picked[i] = o)
+                                      : null),
+                            if (sel != null)
+                              Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                            sel == ans
+                                                ? '✅ Correct'
+                                                : '❌ Wrong. Correct: ${String.fromCharCode(65 + ans)}',
+                                            style: TextStyle(
+                                                fontWeight: FontWeight.bold,
+                                                color: sel == ans
+                                                    ? Colors.green
+                                                    : Colors.red)),
+                                        const SizedBox(height: 4),
+                                        Text('${q['explanation']}'),
+                                        if (q['source'] != null)
+                                          Padding(
+                                              padding: const EdgeInsets.only(top: 4),
+                                              child: Text('📖 "${q['source']}"',
+                                                  style: const TextStyle(
+                                                      fontStyle: FontStyle.italic))),
+                                        if (page != null && pdfBytes != null)
+                                          TextButton.icon(
+                                              icon: const Icon(Icons.menu_book),
+                                              label: Text('Open book page $page'),
+                                              onPressed: () => Navigator.push(
+                                                  context,
+                                                  MaterialPageRoute(
+                                                      builder: (_) =>
+                                                          PdfJump(pdfBytes!, page)))),
+                                      ])),
+                          ])));
+            }
+          }
+
+          class PdfJump extends StatelessWidget {
+            final Uint8List bytes;
+            final int page;
+            const PdfJump(this.bytes, this.page, {super.key});
+            @override
+            Widget build(BuildContext c) => Scaffold(
+                appBar: AppBar(title: Text('Page $page')),
+                body: viewer.SfPdfViewer.memory(bytes, initialPageNumber: page));
+          }
+          EOF
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+      - run: flutter pub get
+      - run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcq-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
