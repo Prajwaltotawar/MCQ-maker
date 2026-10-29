@@ -62,6 +62,7 @@ jobs:
             String fileText = '';
             String fileName = '';
             String status = '';
+            String? model;
             Uint8List? pdfBytes;
             List<Uint8List> photos = [];
             int count = 10;
@@ -150,11 +151,42 @@ jobs:
               return out;
             }
 
+            Future<String> pickModel() async {
+              if (model != null) return model!;
+              try {
+                final r = await http.get(Uri.parse(
+                    'https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${key.text.trim()}'));
+                final list = (jsonDecode(r.body)['models'] as List)
+                    .where((m) => (m['supportedGenerationMethods'] as List)
+                        .contains('generateContent'))
+                    .map((m) => (m['name'] as String).replaceFirst('models/', ''))
+                    .where((n) => RegExp(r'^gemini-[\d.]+-flash$').hasMatch(n))
+                    .toList();
+                List<int> v(String n) =>
+                    n.split('-')[1].split('.').map(int.parse).toList();
+                list.sort((a, b) {
+                  final x = v(a), y = v(b);
+                  for (var i = 0; i < max(x.length, y.length); i++) {
+                    final p = i < x.length ? x[i] : 0;
+                    final q = i < y.length ? y[i] : 0;
+                    if (p != q) return q.compareTo(p);
+                  }
+                  return 0;
+                });
+                if (list.isNotEmpty) {
+                  model = list.first;
+                  return model!;
+                }
+              } catch (_) {}
+              return 'gemini-3.8-flash';
+            }
+
             Future<List> ask(List parts) async {
               for (var t = 0; t < 4; t++) {
+                final m = await pickModel();
                 final res = await http.post(
                     Uri.parse(
-                        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.text.trim()}'),
+                        'https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent?key=${key.text.trim()}'),
                     headers: {'Content-Type': 'application/json'},
                     body: jsonEncode({
                       'contents': [
@@ -162,9 +194,13 @@ jobs:
                       ],
                       'generationConfig': {
                         'responseMimeType': 'application/json',
-                        'maxOutputTokens': 65000
+                        'maxOutputTokens': 30000
                       }
                     }));
+                if (res.statusCode == 404) {
+                  model = null;
+                  continue;
+                }
                 if (res.statusCode == 429 || res.statusCode == 503) {
                   await Future.delayed(const Duration(seconds: 20));
                   continue;
@@ -174,7 +210,7 @@ jobs:
                 final out = jsonDecode(j['candidates'][0]['content']['parts'][0]['text']);
                 return out is List ? out : [out];
               }
-              throw 'Rate limit hit. Try again later.';
+              throw 'Rate limit or model error. Try again later.';
             }
 
             Future<void> generate() async {
